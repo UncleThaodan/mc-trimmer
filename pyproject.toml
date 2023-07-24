@@ -3,9 +3,11 @@ name = "mc-trimmer"
 version = "0.1.0"
 description = ""
 authors = [
-    {name = "Thaodan", email = ""},
+    {name = "Thaodan"},
 ]
-dependencies = []
+dependencies = [
+    "NBT>=1.5.1",
+]
 requires-python = ">=3.10"
 readme = "README.md"
 license = {text = "MIT"}

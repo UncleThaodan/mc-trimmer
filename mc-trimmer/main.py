@@ -5,11 +5,10 @@ from abc import abstractmethod
 import io
 from pathlib import Path
 import struct
-from typing import Any, Callable, Iterable, Self, Type, TypeVar
+from typing import Callable, Iterable, Self, Type, TypeVar
 from enum import IntEnum
 import zlib
-from nbt.nbt import NBTFile, TAG_Compound
-import copy
+from nbt.nbt import TAG_Compound
 
 
 PATH = "./data"
@@ -81,8 +80,6 @@ class ChunkLocation(Serializable):
     @classmethod
     def from_bytes(cls, data: bytes) -> Self:
         offset, size = struct.unpack(">IB", b'\x00' + data)  # 3 byte offset, 1 byte size
-        if (size != 0):
-            pass
         return cls(offset=offset, size=size)
 
     def __bytes__(self) -> bytes:
@@ -92,7 +89,6 @@ class ChunkLocation(Serializable):
     @property
     def SIZE(cls) -> int:
         return 4
-
 
 class Timestamp(Serializable):
     def __init__(self, timestamp: int) -> None:
@@ -127,12 +123,6 @@ class Chunk(Serializable):
         else:
             self.nbt = TAG_Compound()
 
-        a = bytes(self)[Sizes.CHUNK_HEADER_SIZE:]
-        b = bytes(self._compressed_data)
-        y = len(a)
-        z = len(b)
-        assert a[:z] == b
-
     @classmethod
     def from_bytes(cls: type[Self], data: bytes) -> Self:
         length, compression = struct.unpack(">IB", data[:Sizes.CHUNK_HEADER_SIZE])
@@ -153,7 +143,7 @@ class Chunk(Serializable):
             data = struct.pack(">IB", l1 + 1, self._compression) + self._compressed_data # +1 for compression scheme
             l = len(data)
             assert l1 + Sizes.CHUNK_HEADER_SIZE == l
-            padding = 4096 - (l % 4096)
+            padding = ((4096 - (l % 4096)) % 4096)
             data = data + b'\x00' * padding
             return data
         return b''
@@ -162,9 +152,6 @@ class Chunk(Serializable):
     def SIZE(self) -> int:
         return Sizes.CHUNK_HEADER_SIZE + len(self._compressed_data)
 
-
-print(Timestamp.__dict__)
-
 TimestampData = Timestamp * 1024
 ChunkLocationData = ChunkLocation * 1024
 
@@ -172,7 +159,7 @@ ChunkLocationData = ChunkLocation * 1024
 def get_regions(path: str | Path) -> Iterable[Path]:
     p: Path = Path(path)
     if p.exists() and p.is_dir():
-        return (f for f in p.glob("*.mca") if f.is_file())
+        return (f for f in p.glob("*8.mca") if f.is_file())
     raise Exception(f"Invalid input <{p}>")
 
 
@@ -180,7 +167,7 @@ class Region:
     def __init__(self, chunk_location_data: bytes, timestamps_data: bytes, data: bytes) -> None:
         self.locations = ChunkLocationData().from_bytes(chunk_location_data)
 
-        self.locaiton_order: list[ChunkLocation] = self.locations
+        self.location_order: list[ChunkLocation] = self.locations
         self.__timestamps = TimestampData().from_bytes(timestamps_data)
         self.__data = data
         self.dirty: bool = False
@@ -192,12 +179,16 @@ class Region:
         assert(b == a)
 
         self.__chunks: list[Chunk] = []
-        for loc in self.locaiton_order:
+        for loc in self.location_order:
             if loc.size > 0:
                 # location is relative to beginning of file, so timestamp and location table have to be subtracted.
-                data_slice = self.__data[loc.offset * Sizes.CHUNK_SIZE_MULTIPLIER - Sizes.CHUNK_LOCATION_DATA_SIZE - Sizes.TIMESTAMPS_DATA_SIZE: ]
+                s = loc.offset * Sizes.CHUNK_SIZE_MULTIPLIER - Sizes.CHUNK_LOCATION_DATA_SIZE - Sizes.TIMESTAMPS_DATA_SIZE
+                data_slice = self.__data[s: s + loc.size * 4096]
                 chunk = Chunk.from_bytes(data_slice)
                 self.__chunks.append(chunk)
+
+                b = bytes(chunk)
+                a = bytes(data_slice)
             else:
                 self.__chunks.append(Chunk())
         pass
@@ -216,40 +207,47 @@ class Region:
             return Region(chunk_location_data, timestamps_data, memoryview(f.read()))
 
     def __bytes__(self) -> bytes:
-        locations: bytes = b''
-        timestamps: bytes = b''
-
         chunks: list[bytes] = []
+        deltas: list[int] = []
 
-        size_delta: int = 0
-        i = 0
+        for loc, chunk, ts in zip(self.location_order, self.__chunks, self.__timestamps):
+            c_data = bytes(chunk)
+            size_delta: int = 0
+            if loc.size > 0:
+                l = len(c_data)
+                size_delta = loc.size - l // 4096
+                if size_delta != 0:
+                    pass
+                loc.size = l // 4096
 
-        locs = copy.copy(self.locaiton_order)
-        mapping = {l : c for c, l in zip(self.__chunks, self.locaiton_order)}
-        for c, loc in zip(mapping.values(), self.locaiton_order):
-            c_data = bytes(c)
-            l = len(c_data)
-            size_delta += l // 4096 - loc.size
-            loc.offset += size_delta
-            assert size_delta == 0
-            assert loc.size == l // 4096
-            loc.size = l // 4096
-
-            locations += bytes(loc)
+                if loc.size == 0:
+                    loc.offset = 0
+                    ts.timestamp = 0
+            deltas.append(size_delta)
             chunks.append(c_data)
 
-            i += 1
+        cumulative_delta = 0
+        chunk_data: bytes = b''
+        for loc, chunk, ts, delta in sorted(zip(self.location_order, chunks, self.__timestamps, deltas), key=lambda pair: pair[0]):
+            if loc.size > 0 and cumulative_delta != 0:
+                cumulative_delta = min(loc.offset, cumulative_delta)
+                loc.offset -= cumulative_delta
+            if delta != 0:
+                cumulative_delta += delta
+            chunk_data += chunk
 
-        chunk_data = b''.join([x for _, x in sorted(zip(self.locaiton_order, chunks))])
+        location_data: bytes = b''.join((bytes(x) for x in self.location_order))
+        timestamp_data: bytes = b''.join((bytes(x) for x in self.__timestamps))
 
-        for t in self.__timestamps:
-            timestamps += bytes(t)
-
-        return locations + timestamps + chunk_data
+        return location_data + timestamp_data + chunk_data
 
     def save_to_file(self, region: Path) -> None:
-        with open(region, "wb") as f:
-            f.write(bytes(self))
+        data = bytes(self)
+        if len(data) > Sizes.CHUNK_LOCATION_DATA_SIZE + Sizes.TIMESTAMPS_DATA_SIZE:
+            with open(region, "wb") as f:
+                f.write(data)
+        else:
+            print(f"Deleting {region}")
 
 
 
@@ -270,7 +268,7 @@ def start():
         a1, b1 = a.hex(), b.hex()
         assert a1 == b1
 
-        region.trim(lambda nbt: nbt["InhabitedTime"].value > 4)# 20 * 3600 * 0.25)
+        region.trim(lambda nbt: nbt["InhabitedTime"].value < 4)# 20 * 3600 * 0.25)
         if region.dirty:
             region.save_to_file(p)
             r2 = Region.from_file(p)
