@@ -2,11 +2,14 @@
 
 
 from abc import abstractmethod
+import io
 from pathlib import Path
 import struct
 from typing import Any, Callable, Iterable, Self, Type, TypeVar
 from enum import IntEnum
 import zlib
+from nbt.nbt import NBTFile, TAG_Compound
+import copy
 
 
 PATH = "./data"
@@ -16,7 +19,7 @@ class Sizes(IntEnum):
     CHUNK_LOCATION_DATA_SIZE = 4 * 1024
     TIMESTAMPS_DATA_SIZE = 4 * 1024
     CHUNK_SIZE_MULTIPLIER = 4 * 1024
-    CHUNK_HEADER_SIZE = 5
+    CHUNK_HEADER_SIZE = 4 + 1
 
 
 class Meta(type):
@@ -72,6 +75,9 @@ class ChunkLocation(Serializable):
     def __repr__(self) -> str:
         return str(f'{self.__class__}: {self.offset}+{self.size}')
 
+    def __lt__(self, other: Self):
+        return self.offset < other.offset
+
     @classmethod
     def from_bytes(cls, data: bytes) -> Self:
         offset, size = struct.unpack(">IB", b'\x00' + data)  # 3 byte offset, 1 byte size
@@ -109,35 +115,52 @@ class Timestamp(Serializable):
         return 4
 
 class Chunk(Serializable):
-    def __init__(self, len: int = 0, compression: int = 2, data: bytes = b'') -> None:
-        self._len: int = len
+    def __init__(self, length: int = 0, compression: int = 2, data: bytes = b'') -> None:
         self._compression: int = compression
-        self._unpacked_data: bytes = data
+        self._compressed_data: bytes = data
+        self.nbt: TAG_Compound
 
+        if length > 0:
+            decompressed_data = zlib.decompress(self._compressed_data)
+            member_data = decompressed_data[3 : ]  # 3 bytes removes root tag opening
+            self.nbt = TAG_Compound(buffer=io.BytesIO(member_data))
+        else:
+            self.nbt = TAG_Compound()
+
+        a = bytes(self)[Sizes.CHUNK_HEADER_SIZE:]
+        b = bytes(self._compressed_data)
+        y = len(a)
+        z = len(b)
+        assert a[:z] == b
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> Self:
-        len, compression = struct.unpack(">IB", data[:Sizes.CHUNK_HEADER_SIZE])
+    def from_bytes(cls: type[Self], data: bytes) -> Self:
+        length, compression = struct.unpack(">IB", data[:Sizes.CHUNK_HEADER_SIZE])
         assert compression == 2
-        dd = zlib.decompress(data[Sizes.CHUNK_HEADER_SIZE : Sizes.CHUNK_HEADER_SIZE + len])
-        return cls(len=len, compression=compression, data=dd)
+        return cls(length=length, compression=compression, data=data[Sizes.CHUNK_HEADER_SIZE: Sizes.CHUNK_HEADER_SIZE + length - 1])
 
-    def conditional_reset(self, condition: Callable[[Self], bool]):
-        if condition(self):
-            self._len = 0
-            self._unpacked_data = b''
+    def conditional_reset(self, condition: Callable[[TAG_Compound], bool]) -> bool:
+        if self._compressed_data != b'':
+            if condition(self.nbt):
+                self._compressed_data = b''
+                self.nbt = TAG_Compound()
+                return True
+        return False
 
     def __bytes__(self) -> bytes:
-        if self._unpacked_data != b'':
-            compressed_data = zlib.compress(self._unpacked_data)
-            data = struct.pack(">IB", len(compressed_data), self._compression) + compressed_data
-            self._len = len(data)
+        if self._compressed_data != b'':
+            l1 = len(self._compressed_data)
+            data = struct.pack(">IB", l1 + 1, self._compression) + self._compressed_data # +1 for compression scheme
+            l = len(data)
+            assert l1 + Sizes.CHUNK_HEADER_SIZE == l
+            padding = 4096 - (l % 4096)
+            data = data + b'\x00' * padding
             return data
         return b''
 
     @property
     def SIZE(self) -> int:
-        return Sizes.CHUNK_HEADER_SIZE + self._len
+        return Sizes.CHUNK_HEADER_SIZE + len(self._compressed_data)
 
 
 print(Timestamp.__dict__)
@@ -155,47 +178,105 @@ def get_regions(path: str | Path) -> Iterable[Path]:
 
 class Region:
     def __init__(self, chunk_location_data: bytes, timestamps_data: bytes, data: bytes) -> None:
-        self.__locations = ChunkLocationData().from_bytes(chunk_location_data)
+        self.locations = ChunkLocationData().from_bytes(chunk_location_data)
+
+        self.locaiton_order: list[ChunkLocation] = self.locations
         self.__timestamps = TimestampData().from_bytes(timestamps_data)
         self.__data = data
+        self.dirty: bool = False
 
         # Test:
-        a = bytes(self.__locations)
-        b = bytes(chunk_location_data)
-        assert(b == a)
 
         a = bytes(self.__timestamps)
         b = bytes(timestamps_data)
         assert(b == a)
 
         self.__chunks: list[Chunk] = []
-        for loc in self.__locations:
-            if loc.size == 0:
-                self.__chunks.append(Chunk())
-            else:
+        for loc in self.locaiton_order:
+            if loc.size > 0:
                 # location is relative to beginning of file, so timestamp and location table have to be subtracted.
-                self.__chunks.append(Chunk.from_bytes(self.__data[loc.offset * Sizes.CHUNK_SIZE_MULTIPLIER - Sizes.CHUNK_LOCATION_DATA_SIZE - Sizes.TIMESTAMPS_DATA_SIZE: ]))
+                data_slice = self.__data[loc.offset * Sizes.CHUNK_SIZE_MULTIPLIER - Sizes.CHUNK_LOCATION_DATA_SIZE - Sizes.TIMESTAMPS_DATA_SIZE: ]
+                chunk = Chunk.from_bytes(data_slice)
+                self.__chunks.append(chunk)
+            else:
+                self.__chunks.append(Chunk())
         pass
 
-    def trim(self, condition: Callable[[Chunk], bool]):
+    def trim(self, condition: Callable[[TAG_Compound], bool]):
         for c in self.__chunks:
-            c.conditional_reset(condition)
+            self.dirty |= c.conditional_reset(condition)
 
 
+    @classmethod
+    def from_file(cls, region: Path) -> Self:
+        with open(region, "+rb") as f:
+            chunk_location_data: bytes = memoryview(f.read(Sizes.CHUNK_LOCATION_DATA_SIZE))
+            timestamps_data: bytes = memoryview(f.read(Sizes.TIMESTAMPS_DATA_SIZE))
 
-def open_region(region: Path):
-    with open(region, "+rb") as f:
-        chunk_location_data: bytes = memoryview(f.read(Sizes.CHUNK_LOCATION_DATA_SIZE))
-        timestamps_data: bytes = memoryview(f.read(Sizes.TIMESTAMPS_DATA_SIZE))
+            return Region(chunk_location_data, timestamps_data, memoryview(f.read()))
 
-        a = Region(chunk_location_data, timestamps_data, memoryview(f.read()))
-        pass
+    def __bytes__(self) -> bytes:
+        locations: bytes = b''
+        timestamps: bytes = b''
+
+        chunks: list[bytes] = []
+
+        size_delta: int = 0
+        i = 0
+
+        locs = copy.copy(self.locaiton_order)
+        mapping = {l : c for c, l in zip(self.__chunks, self.locaiton_order)}
+        for c, loc in zip(mapping.values(), self.locaiton_order):
+            c_data = bytes(c)
+            l = len(c_data)
+            size_delta += l // 4096 - loc.size
+            loc.offset += size_delta
+            assert size_delta == 0
+            assert loc.size == l // 4096
+            loc.size = l // 4096
+
+            locations += bytes(loc)
+            chunks.append(c_data)
+
+            i += 1
+
+        chunk_data = b''.join([x for _, x in sorted(zip(self.locaiton_order, chunks))])
+
+        for t in self.__timestamps:
+            timestamps += bytes(t)
+
+        return locations + timestamps + chunk_data
+
+    def save_to_file(self, region: Path) -> None:
+        with open(region, "wb") as f:
+            f.write(bytes(self))
+
 
 
 def start():
     for r in get_regions(PATH):
         print(r)
-        open_region(r)
+        region = Region.from_file(r)
+
+        with open(r, "+rb") as f:
+            a = f.read()
+        b = bytes(region)
+
+        p = r.with_name("r.-13.9.mca")
+        region.save_to_file(p)
+        i = 0
+        y = len(a)
+        z = len(b)
+        a1, b1 = a.hex(), b.hex()
+        assert a1 == b1
+
+        region.trim(lambda nbt: nbt["InhabitedTime"].value > 4)# 20 * 3600 * 0.25)
+        if region.dirty:
+            region.save_to_file(p)
+            r2 = Region.from_file(p)
+            pass
+
+
     exit()
 
 
